@@ -14,5 +14,7 @@
     "--background-index",
     "--query-driver=**",
     "--compile-commands-dir=/home/asd1115056/ESP32c6 with 4 Relays/build"
-  ]
+  ],
+  "idf.monitorPort": "/dev/ttyACM0",
+  "idf.flashType": "UART"
 }
