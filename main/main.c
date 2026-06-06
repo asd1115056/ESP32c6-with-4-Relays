@@ -19,12 +19,16 @@
 #define RESET_GPIO		11
 #define RESET_HOLD_MS		3000
 
+#define RELAY_COUNT		4
+static const int s_relay_gpio[RELAY_COUNT] = { 19, 20, 21, 22 };
+
 #define WIFI_CONNECTED_BIT	BIT0
 
 ESP_EVENT_DEFINE_BASE(RELAY_EVENT);
 
 typedef enum {
 	RELAY_EVENT_HELLO,
+	RELAY_EVENT_SET,
 } relay_event_id_t;
 
 typedef struct {
@@ -32,11 +36,19 @@ typedef struct {
 	struct sockaddr_in src_addr;
 } relay_hello_data_t;
 
+typedef struct {
+	int sock;
+	struct sockaddr_in src_addr;
+	struct { int id; int on; } children[RELAY_COUNT];
+	int count;
+} relay_set_data_t;
+
 static const char *TAG = "relay";
 static EventGroupHandle_t s_wifi_event_group;
 static esp_event_loop_handle_t s_relay_loop;
 static int s_retry_count;
 static bool s_prov_done;
+static int s_relay_state[RELAY_COUNT];
 
 /* ── WiFi ─────────────────────────────────────────────────────────── */
 
@@ -88,6 +100,16 @@ static void prov_event_handler(void *arg, esp_event_base_t base,
 		s_prov_done = true;
 		network_prov_mgr_deinit();
 		break;
+	}
+}
+
+static void relay_init(void)
+{
+	for (int i = 0; i < RELAY_COUNT; i++) {
+		gpio_reset_pin(s_relay_gpio[i]);
+		gpio_set_direction(s_relay_gpio[i], GPIO_MODE_OUTPUT);
+		gpio_set_level(s_relay_gpio[i], 1); /* active LOW: HIGH = off */
+		s_relay_state[i] = 0;
 	}
 }
 
@@ -164,6 +186,19 @@ static void wifi_init_sta(void)
 
 /* ── Event handlers ───────────────────────────────────────────────── */
 
+static void build_children_array(cJSON *parent)
+{
+	cJSON *children = cJSON_CreateArray();
+
+	for (int i = 0; i < RELAY_COUNT; i++) {
+		cJSON *child = cJSON_CreateObject();
+		cJSON_AddNumberToObject(child, "id", i);
+		cJSON_AddNumberToObject(child, "on", s_relay_state[i]);
+		cJSON_AddItemToArray(children, child);
+	}
+	cJSON_AddItemToObject(parent, "children", children);
+}
+
 static void hello_handler(void *arg, esp_event_base_t base,
 			   int32_t id, void *data)
 {
@@ -184,18 +219,54 @@ static void hello_handler(void *arg, esp_event_base_t base,
 		 mac[0], mac[1], mac[2],
 		 mac[3], mac[4], mac[5]);
 
+	cJSON *sysinfo = cJSON_CreateObject();
+	cJSON_AddStringToObject(sysinfo, "mac", mac_str);
+	cJSON_AddStringToObject(sysinfo, "ip", ip_str);
+	cJSON_AddStringToObject(sysinfo, "type", "relay4");
+	cJSON_AddStringToObject(sysinfo, "version", "1.0");
+	build_children_array(sysinfo);
+	cJSON_AddNumberToObject(sysinfo, "err_code", 0);
+
 	cJSON *reply = cJSON_CreateObject();
-	cJSON_AddStringToObject(reply, "mac", mac_str);
-	cJSON_AddStringToObject(reply, "ip", ip_str);
-	cJSON_AddStringToObject(reply, "type", "relay4");
-	cJSON_AddStringToObject(reply, "version", "1.0");
+	cJSON_AddItemToObject(reply, "sysinfo", sysinfo);
 	char *reply_str = cJSON_PrintUnformatted(reply);
 	cJSON_Delete(reply);
 
 	sendto(d->sock, reply_str, strlen(reply_str), 0,
 	       (struct sockaddr *)&d->src_addr,
 	       sizeof(d->src_addr));
-	ESP_LOGI(TAG, "hello reply: %s", reply_str);
+	ESP_LOGI(TAG, "sysinfo reply: %s", reply_str);
+	free(reply_str);
+}
+
+static void set_handler(void *arg, esp_event_base_t base,
+			int32_t id, void *data)
+{
+	relay_set_data_t *d = data;
+
+	for (int i = 0; i < d->count; i++) {
+		int rid = d->children[i].id;
+		int on  = d->children[i].on;
+
+		if (rid < 0 || rid >= RELAY_COUNT)
+			continue;
+		s_relay_state[rid] = on;
+		gpio_set_level(s_relay_gpio[rid], on ? 0 : 1);
+	}
+
+	cJSON *set = cJSON_CreateObject();
+	build_children_array(set);
+	cJSON_AddNumberToObject(set, "err_code", 0);
+
+	cJSON *reply = cJSON_CreateObject();
+	cJSON_AddItemToObject(reply, "set", set);
+	char *reply_str = cJSON_PrintUnformatted(reply);
+	cJSON_Delete(reply);
+
+	sendto(d->sock, reply_str, strlen(reply_str), 0,
+	       (struct sockaddr *)&d->src_addr,
+	       sizeof(d->src_addr));
+	ESP_LOGI(TAG, "set reply: %s", reply_str);
 	free(reply_str);
 }
 
@@ -261,13 +332,53 @@ static void udp_task(void *arg)
 			sock = -1;
 			continue;
 		}
-		relay_hello_data_t ev = {
-			.sock     = sock,
-			.src_addr = src,
-		};
-		esp_event_post_to(s_relay_loop, RELAY_EVENT,
-				  RELAY_EVENT_HELLO,
-				  &ev, sizeof(ev), 0);
+		rx_buf[len] = '\0';
+
+		cJSON *root = cJSON_Parse(rx_buf);
+		cJSON *cmd  = root ?
+			cJSON_GetObjectItem(root, "cmd") : NULL;
+
+		if (cmd && cJSON_IsString(cmd) &&
+		    strcmp(cmd->valuestring, "set") == 0) {
+			relay_set_data_t ev = {
+				.sock     = sock,
+				.src_addr = src,
+				.count    = 0,
+			};
+			cJSON *arr = cJSON_GetObjectItem(root, "children");
+			cJSON *child;
+
+			cJSON_ArrayForEach(child, arr) {
+				if (ev.count >= RELAY_COUNT)
+					break;
+				cJSON *cid =
+					cJSON_GetObjectItem(child, "id");
+				cJSON *con =
+					cJSON_GetObjectItem(child, "on");
+				if (!cJSON_IsNumber(cid) ||
+				    !cJSON_IsNumber(con))
+					continue;
+				ev.children[ev.count].id =
+					(int)cid->valuedouble;
+				ev.children[ev.count].on =
+					(int)con->valuedouble;
+				ev.count++;
+			}
+			esp_event_post_to(s_relay_loop, RELAY_EVENT,
+					  RELAY_EVENT_SET,
+					  &ev, sizeof(ev), 0);
+		} else {
+			relay_hello_data_t ev = {
+				.sock     = sock,
+				.src_addr = src,
+			};
+			esp_event_post_to(s_relay_loop, RELAY_EVENT,
+					  RELAY_EVENT_HELLO,
+					  &ev, sizeof(ev), 0);
+		}
+
+		if (root)
+			cJSON_Delete(root);
 	}
 }
 
@@ -297,7 +408,11 @@ void app_main(void)
 	ESP_ERROR_CHECK(esp_event_handler_register_with(
 		s_relay_loop, RELAY_EVENT, RELAY_EVENT_HELLO,
 		hello_handler, NULL));
+	ESP_ERROR_CHECK(esp_event_handler_register_with(
+		s_relay_loop, RELAY_EVENT, RELAY_EVENT_SET,
+		set_handler, NULL));
 
+	relay_init();
 	wifi_init_sta();
 	ESP_LOGI(TAG, "starting udp task");
 	xTaskCreate(udp_task, "udp_task", 4096, NULL, 5, NULL);
