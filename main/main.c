@@ -10,11 +10,14 @@
 #include "nvs_flash.h"
 #include "lwip/sockets.h"
 #include "cJSON.h"
+#include "network_provisioning/manager.h"
+#include "network_provisioning/scheme_ble.h"
+#include "driver/gpio.h"
 
-#define WIFI_SSID		"your-ssid-here"
-#define WIFI_PASS		"your-password-here"
 #define UDP_PORT		12345
 #define WIFI_MAX_RETRY		5
+#define RESET_GPIO		11
+#define RESET_HOLD_MS		3000
 
 #define WIFI_CONNECTED_BIT	BIT0
 
@@ -33,6 +36,7 @@ static const char *TAG = "relay";
 static EventGroupHandle_t s_wifi_event_group;
 static esp_event_loop_handle_t s_relay_loop;
 static int s_retry_count;
+static bool s_prov_done;
 
 /* ── WiFi ─────────────────────────────────────────────────────────── */
 
@@ -47,6 +51,8 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
 		   id == WIFI_EVENT_STA_DISCONNECTED) {
 		xEventGroupClearBits(s_wifi_event_group,
 				     WIFI_CONNECTED_BIT);
+		if (!s_prov_done)
+			return;
 		if (++s_retry_count > WIFI_MAX_RETRY) {
 			ESP_LOGE(TAG, "wifi failed, restarting");
 			esp_restart();
@@ -61,8 +67,50 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
 	}
 }
 
+static void prov_event_handler(void *arg, esp_event_base_t base,
+				int32_t id, void *data)
+{
+	switch (id) {
+	case NETWORK_PROV_START:
+		ESP_LOGI(TAG, "provisioning started");
+		break;
+	case NETWORK_PROV_WIFI_CRED_RECV:
+		ESP_LOGI(TAG, "credentials received");
+		break;
+	case NETWORK_PROV_WIFI_CRED_FAIL:
+		ESP_LOGE(TAG, "provisioning failed, retry");
+		network_prov_mgr_reset_wifi_sm_state_on_failure();
+		break;
+	case NETWORK_PROV_WIFI_CRED_SUCCESS:
+		ESP_LOGI(TAG, "provisioning successful");
+		break;
+	case NETWORK_PROV_END:
+		s_prov_done = true;
+		network_prov_mgr_deinit();
+		break;
+	}
+}
+
+static bool reset_button_held(void)
+{
+	gpio_reset_pin(RESET_GPIO);
+	gpio_set_direction(RESET_GPIO, GPIO_MODE_INPUT);
+	gpio_set_pull_mode(RESET_GPIO, GPIO_PULLUP_ONLY);
+
+	if (gpio_get_level(RESET_GPIO) != 0)
+		return false;
+
+	ESP_LOGW(TAG, "reset held, keep for %d ms to clear wifi",
+		 RESET_HOLD_MS);
+	vTaskDelay(pdMS_TO_TICKS(RESET_HOLD_MS));
+	return gpio_get_level(RESET_GPIO) == 0;
+}
+
 static void wifi_init_sta(void)
 {
+	uint8_t mac[6];
+	char service_name[16];
+
 	ESP_LOGI(TAG, "wifi init start");
 	s_wifi_event_group = xEventGroupCreate();
 
@@ -79,16 +127,36 @@ static void wifi_init_sta(void)
 	ESP_ERROR_CHECK(esp_event_handler_instance_register(
 		IP_EVENT, IP_EVENT_STA_GOT_IP,
 		wifi_event_handler, NULL, NULL));
+	ESP_ERROR_CHECK(esp_event_handler_instance_register(
+		NETWORK_PROV_EVENT, ESP_EVENT_ANY_ID,
+		prov_event_handler, NULL, NULL));
 
-	wifi_config_t wifi_config = {
-		.sta = {
-			.ssid     = WIFI_SSID,
-			.password = WIFI_PASS,
-		},
+	network_prov_mgr_config_t prov_cfg = {
+		.scheme               = network_prov_scheme_ble,
+		.scheme_event_handler =
+			NETWORK_PROV_SCHEME_BLE_EVENT_HANDLER_FREE_BLE,
 	};
-	ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-	ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
-	ESP_ERROR_CHECK(esp_wifi_start());
+	ESP_ERROR_CHECK(network_prov_mgr_init(prov_cfg));
+
+	bool provisioned = false;
+	ESP_ERROR_CHECK(network_prov_mgr_is_wifi_provisioned(&provisioned));
+
+	if (!provisioned) {
+		ESP_LOGI(TAG, "starting ble provisioning");
+		esp_wifi_get_mac(WIFI_IF_STA, mac);
+		snprintf(service_name, sizeof(service_name),
+			 "relay_%02x%02x%02x",
+			 mac[3], mac[4], mac[5]);
+		ESP_ERROR_CHECK(network_prov_mgr_start_provisioning(
+			NETWORK_PROV_SECURITY_1, NULL,
+			service_name, NULL));
+	} else {
+		ESP_LOGI(TAG, "already provisioned, connecting");
+		s_prov_done = true;
+		network_prov_mgr_deinit();
+		ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+		ESP_ERROR_CHECK(esp_wifi_start());
+	}
 
 	xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT,
 			    pdFALSE, pdFALSE, portMAX_DELAY);
@@ -216,8 +284,15 @@ void app_main(void)
 	};
 
 	ESP_LOGI(TAG, "app starting");
-	vTaskDelay(pdMS_TO_TICKS(30000));
 	ESP_ERROR_CHECK(nvs_flash_init());
+
+	if (reset_button_held()) {
+		ESP_LOGW(TAG, "reset: clearing wifi credentials");
+		nvs_flash_erase();
+		esp_restart();
+	}
+
+	vTaskDelay(pdMS_TO_TICKS(30000));
 	ESP_ERROR_CHECK(esp_event_loop_create(&loop_args, &s_relay_loop));
 	ESP_ERROR_CHECK(esp_event_handler_register_with(
 		s_relay_loop, RELAY_EVENT, RELAY_EVENT_HELLO,
