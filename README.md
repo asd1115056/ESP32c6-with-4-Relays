@@ -31,7 +31,11 @@ Provisioning uses BLE. The device advertises as `relay_XXYYZZ` (last 3 bytes of 
 3. Open the app → scan → select `relay_XXYYZZ` → enter Wi-Fi credentials
 4. Credentials are saved to NVS and survive reboots
 
-**To re-provision:** hold GPIO 11 to GND for 3 seconds. The device erases credentials and restarts into provisioning mode.
+**To re-provision:** hold GPIO 11 to GND for 3 seconds. The relays will pulse 3 times to confirm, then the device erases credentials and restarts into provisioning mode.
+
+**Provisioning indicator:** while waiting for BLE credentials, the relays cycle in sequence (running light) until Wi-Fi connects.
+
+**Relay state across resets:** relay states are preserved across software resets (e.g. Wi-Fi failure recovery). A power cycle resets all relays to off.
 
 ## UDP Protocol
 

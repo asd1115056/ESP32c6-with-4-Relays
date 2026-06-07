@@ -67,6 +67,8 @@ static bool s_provisioned;
 static __NOINIT_ATTR int s_relay_state[RELAY_COUNT];
 static char s_relay_alias[RELAY_COUNT][ALIAS_MAX_LEN];
 
+static void relay_chase(int rounds);
+
 /* ── Wi-Fi ────────────────────────────────────────────────────────── */
 
 static void wifi_event_handler(void *arg, esp_event_base_t base,
@@ -95,12 +97,22 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
 	}
 }
 
+static void prov_indicator_task(void *arg)
+{
+	while (!(xEventGroupGetBits(s_wifi_event_group) & WIFI_CONNECTED_BIT)) {
+		relay_chase(1);
+		vTaskDelay(pdMS_TO_TICKS(3000));
+	}
+	vTaskDelete(NULL);
+}
+
 static void prov_event_handler(void *arg, esp_event_base_t base,
 				int32_t id, void *data)
 {
 	switch (id) {
 	case NETWORK_PROV_START:
 		ESP_LOGI(TAG, "provisioning started");
+		xTaskCreate(prov_indicator_task, "prov_ind", 2048, NULL, 3, NULL);
 		break;
 	case NETWORK_PROV_WIFI_CRED_RECV:
 		ESP_LOGI(TAG, "credentials received");
@@ -186,6 +198,29 @@ static void relay_init(void)
 		gpio_reset_pin(s_relay_gpio[i]);
 		gpio_set_level(s_relay_gpio[i], s_relay_state[i]);
 		gpio_set_direction(s_relay_gpio[i], GPIO_MODE_OUTPUT);
+	}
+}
+
+static void relay_pulse_all(int times)
+{
+	for (int t = 0; t < times; t++) {
+		for (int i = 0; i < RELAY_COUNT; i++)
+			gpio_set_level(s_relay_gpio[i], 1);
+		vTaskDelay(pdMS_TO_TICKS(150));
+		for (int i = 0; i < RELAY_COUNT; i++)
+			gpio_set_level(s_relay_gpio[i], 0);
+		vTaskDelay(pdMS_TO_TICKS(150));
+	}
+}
+
+static void relay_chase(int rounds)
+{
+	for (int r = 0; r < rounds; r++) {
+		for (int i = 0; i < RELAY_COUNT; i++) {
+			gpio_set_level(s_relay_gpio[i], 1);
+			vTaskDelay(pdMS_TO_TICKS(120));
+			gpio_set_level(s_relay_gpio[i], 0);
+		}
 	}
 }
 
@@ -526,9 +561,11 @@ void app_main(void)
 
 	ESP_LOGI(TAG, "app starting");
 	ESP_ERROR_CHECK(nvs_flash_init());
+	relay_init();
 
 	if (reset_button_held()) {
 		ESP_LOGW(TAG, "reset: clearing wifi credentials");
+		relay_pulse_all(3);
 		nvs_flash_erase();
 		esp_restart();
 	}
@@ -543,8 +580,6 @@ void app_main(void)
 	ESP_ERROR_CHECK(esp_event_handler_register_with(
 		s_relay_loop, RELAY_EVENT, RELAY_EVENT_SET_ALIAS,
 		set_alias_handler, NULL));
-
-	relay_init();
 	relay_alias_load();
 	wifi_setup();
 	ESP_LOGI(TAG, "starting udp task");
