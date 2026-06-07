@@ -86,18 +86,31 @@ Aliases are persisted in NVS.
 {"id": 1, "error": {"code": -32601, "message": "method not found"}}
 ```
 
-## Quick Test
+## Tools
 
-**Linux / macOS:**
+`tools/relay_ctl.py` is a Python 3 CLI for testing. No external dependencies.
+
+**Required flags** (all subcommands):
+
+| Flag | Description |
+|---|---|
+| `--host` | Broadcast or device IP (e.g. `192.168.1.255`) |
+| `--mac` | Target device MAC address (e.g. `aa:bb:cc:dd:ee:ff`) |
+
+The tool broadcasts `get_sysinfo`, matches the response by MAC, then sends the command to the resolved IP.
+
+**Examples:**
+
 ```bash
-echo '{"id":1,"method":"get_sysinfo","params":{}}' | nc -u -w1 <device-ip> 12345
-```
+# Show device info and all relay states
+python tools/relay_ctl.py --host 192.168.1.255 --mac aa:bb:cc:dd:ee:ff status
 
-**Windows PowerShell:**
-```powershell
-$udp = New-Object System.Net.Sockets.UdpClient
-$udp.Connect("<device-ip>", 12345)
-$bytes = [Text.Encoding]::UTF8.GetBytes('{"id":1,"method":"get_sysinfo","params":{}}')
-$udp.Send($bytes, $bytes.Length)
-$udp.Close()
+# Turn relay 0 and 1 on
+python tools/relay_ctl.py --host 192.168.1.255 --mac aa:bb:cc:dd:ee:ff on 0 1
+
+# Turn relay 2 off
+python tools/relay_ctl.py --host 192.168.1.255 --mac aa:bb:cc:dd:ee:ff off 2
+
+# Set alias for relay 0
+python tools/relay_ctl.py --host 192.168.1.255 --mac aa:bb:cc:dd:ee:ff alias 0 "living room"
 ```
