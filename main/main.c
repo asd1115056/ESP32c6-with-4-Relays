@@ -529,7 +529,6 @@ void app_main(void)
 		esp_restart();
 	}
 
-	vTaskDelay(pdMS_TO_TICKS(30000));
 	ESP_ERROR_CHECK(esp_event_loop_create(&loop_args, &s_relay_loop));
 	ESP_ERROR_CHECK(esp_event_handler_register_with(
 		s_relay_loop, RELAY_EVENT, RELAY_EVENT_GET_SYSINFO,
