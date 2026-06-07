@@ -59,7 +59,6 @@ Follows [Linux kernel C style](https://www.kernel.org/doc/html/latest/process/co
 - **Naming**: `snake_case` for functions/variables, `ALL_CAPS` for macros and constants; task functions use `_task` suffix
 - **Comments**: `/* */` block style; `//` only for short inline notes
 - **No typedef for structs** — use `struct foo` directly unless it's a function pointer or opaque handle
-- **GPIO init order**: `gpio_reset_pin()` → `gpio_set_direction()` → `gpio_set_level()`
 
 ## Debugging
 
