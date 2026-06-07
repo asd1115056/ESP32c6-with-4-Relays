@@ -62,11 +62,11 @@ static const char *TAG = "relay";
 static EventGroupHandle_t s_wifi_event_group;
 static esp_event_loop_handle_t s_relay_loop;
 static int s_retry_count;
-static bool s_prov_done;
+static bool s_provisioned;
 static int s_relay_state[RELAY_COUNT];
 static char s_relay_alias[RELAY_COUNT][ALIAS_MAX_LEN];
 
-/* ── WiFi ─────────────────────────────────────────────────────────── */
+/* ── Wi-Fi ────────────────────────────────────────────────────────── */
 
 static void wifi_event_handler(void *arg, esp_event_base_t base,
 				int32_t id, void *data)
@@ -77,9 +77,8 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
 		esp_wifi_connect();
 	} else if (base == WIFI_EVENT &&
 		   id == WIFI_EVENT_STA_DISCONNECTED) {
-		xEventGroupClearBits(s_wifi_event_group,
-				     WIFI_CONNECTED_BIT);
-		if (!s_prov_done)
+		xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+		if (!s_provisioned)
 			return;
 		if (++s_retry_count > WIFI_MAX_RETRY) {
 			ESP_LOGE(TAG, "wifi failed, restarting");
@@ -113,10 +112,65 @@ static void prov_event_handler(void *arg, esp_event_base_t base,
 		ESP_LOGI(TAG, "provisioning successful");
 		break;
 	case NETWORK_PROV_END:
-		s_prov_done = true;
+		s_provisioned = true;
 		network_prov_mgr_deinit();
 		break;
 	}
+}
+
+static void wifi_setup(void)
+{
+	uint8_t mac[6];
+	char service_name[16];
+
+	s_wifi_event_group = xEventGroupCreate();
+
+	ESP_ERROR_CHECK(esp_netif_init());
+	ESP_ERROR_CHECK(esp_event_loop_create_default());
+	esp_netif_create_default_wifi_sta();
+
+	wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+	ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+	ESP_ERROR_CHECK(esp_event_handler_instance_register(
+		WIFI_EVENT, ESP_EVENT_ANY_ID,
+		wifi_event_handler, NULL, NULL));
+	ESP_ERROR_CHECK(esp_event_handler_instance_register(
+		IP_EVENT, IP_EVENT_STA_GOT_IP,
+		wifi_event_handler, NULL, NULL));
+	ESP_ERROR_CHECK(esp_event_handler_instance_register(
+		NETWORK_PROV_EVENT, ESP_EVENT_ANY_ID,
+		prov_event_handler, NULL, NULL));
+
+	network_prov_mgr_config_t prov_cfg = {
+		.scheme               = network_prov_scheme_ble,
+		.scheme_event_handler =
+			NETWORK_PROV_SCHEME_BLE_EVENT_HANDLER_FREE_BLE,
+	};
+	ESP_ERROR_CHECK(network_prov_mgr_init(prov_cfg));
+
+	bool provisioned = false;
+	ESP_ERROR_CHECK(network_prov_mgr_is_wifi_provisioned(&provisioned));
+
+	if (!provisioned) {
+		ESP_LOGI(TAG, "starting ble provisioning");
+		esp_wifi_get_mac(WIFI_IF_STA, mac);
+		snprintf(service_name, sizeof(service_name),
+			 "relay_%02x%02x%02x",
+			 mac[3], mac[4], mac[5]);
+		ESP_ERROR_CHECK(network_prov_mgr_start_provisioning(
+			NETWORK_PROV_SECURITY_1, NULL,
+			service_name, NULL));
+	} else {
+		ESP_LOGI(TAG, "already provisioned, connecting");
+		s_provisioned = true;
+		network_prov_mgr_deinit();
+		ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+		ESP_ERROR_CHECK(esp_wifi_start());
+	}
+
+	xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT,
+			    pdFALSE, pdFALSE, portMAX_DELAY);
 }
 
 /* ── Relay ────────────────────────────────────────────────────────── */
@@ -165,63 +219,7 @@ static bool reset_button_held(void)
 	return gpio_get_level(RESET_GPIO) == 0;
 }
 
-static void wifi_init_sta(void)
-{
-	uint8_t mac[6];
-	char service_name[16];
-
-	ESP_LOGI(TAG, "wifi init start");
-	s_wifi_event_group = xEventGroupCreate();
-
-	ESP_ERROR_CHECK(esp_netif_init());
-	ESP_ERROR_CHECK(esp_event_loop_create_default());
-	esp_netif_create_default_wifi_sta();
-
-	wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-	ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-
-	ESP_ERROR_CHECK(esp_event_handler_instance_register(
-		WIFI_EVENT, ESP_EVENT_ANY_ID,
-		wifi_event_handler, NULL, NULL));
-	ESP_ERROR_CHECK(esp_event_handler_instance_register(
-		IP_EVENT, IP_EVENT_STA_GOT_IP,
-		wifi_event_handler, NULL, NULL));
-	ESP_ERROR_CHECK(esp_event_handler_instance_register(
-		NETWORK_PROV_EVENT, ESP_EVENT_ANY_ID,
-		prov_event_handler, NULL, NULL));
-
-	network_prov_mgr_config_t prov_cfg = {
-		.scheme               = network_prov_scheme_ble,
-		.scheme_event_handler =
-			NETWORK_PROV_SCHEME_BLE_EVENT_HANDLER_FREE_BLE,
-	};
-	ESP_ERROR_CHECK(network_prov_mgr_init(prov_cfg));
-
-	bool provisioned = false;
-	ESP_ERROR_CHECK(network_prov_mgr_is_wifi_provisioned(&provisioned));
-
-	if (!provisioned) {
-		ESP_LOGI(TAG, "starting ble provisioning");
-		esp_wifi_get_mac(WIFI_IF_STA, mac);
-		snprintf(service_name, sizeof(service_name),
-			 "relay_%02x%02x%02x",
-			 mac[3], mac[4], mac[5]);
-		ESP_ERROR_CHECK(network_prov_mgr_start_provisioning(
-			NETWORK_PROV_SECURITY_1, NULL,
-			service_name, NULL));
-	} else {
-		ESP_LOGI(TAG, "already provisioned, connecting");
-		s_prov_done = true;
-		network_prov_mgr_deinit();
-		ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-		ESP_ERROR_CHECK(esp_wifi_start());
-	}
-
-	xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT,
-			    pdFALSE, pdFALSE, portMAX_DELAY);
-}
-
-/* ── JSON-RPC helpers ─────────────────────────────────────────────── */
+/* ── RPC helpers ──────────────────────────────────────────────────── */
 
 static void build_children_array(cJSON *parent)
 {
@@ -274,7 +272,7 @@ static void send_error(int sock, struct sockaddr_in *addr,
 	free(s);
 }
 
-/* ── Event handlers ───────────────────────────────────────────────── */
+/* ── RPC handlers ─────────────────────────────────────────────────── */
 
 static void get_sysinfo_handler(void *arg, esp_event_base_t base,
 				int32_t id, void *data)
@@ -384,6 +382,96 @@ static int open_udp_socket(void)
 	return sock;
 }
 
+static void handle_rpc_request(int sock, struct sockaddr_in *src,
+				const char *buf)
+{
+	cJSON *root    = cJSON_Parse(buf);
+	cJSON *id_item = root ? cJSON_GetObjectItem(root, "id")     : NULL;
+	cJSON *method  = root ? cJSON_GetObjectItem(root, "method") : NULL;
+	cJSON *params  = root ? cJSON_GetObjectItem(root, "params") : NULL;
+
+	int req_id = (id_item && cJSON_IsNumber(id_item)) ?
+		     (int)id_item->valuedouble : -1;
+
+	if (!method || !cJSON_IsString(method)) {
+		send_error(sock, src, req_id, -32600, "invalid request");
+		goto done;
+	}
+
+	const char *m = method->valuestring;
+
+	if (strcmp(m, "get_sysinfo") == 0) {
+		relay_sysinfo_data_t ev = {
+			.sock     = sock,
+			.src_addr = *src,
+			.req_id   = req_id,
+		};
+		esp_event_post_to(s_relay_loop, RELAY_EVENT,
+				  RELAY_EVENT_GET_SYSINFO,
+				  &ev, sizeof(ev), 0);
+
+	} else if (strcmp(m, "set_relay_state") == 0) {
+		relay_set_state_data_t ev = {
+			.sock     = sock,
+			.src_addr = *src,
+			.req_id   = req_id,
+			.count    = 0,
+		};
+		cJSON *arr = params ?
+			cJSON_GetObjectItem(params, "children") : NULL;
+		cJSON *child;
+
+		cJSON_ArrayForEach(child, arr) {
+			if (ev.count >= RELAY_COUNT)
+				break;
+			cJSON *cid = cJSON_GetObjectItem(child, "id");
+			cJSON *con = cJSON_GetObjectItem(child, "on");
+			if (!cJSON_IsNumber(cid) || !cJSON_IsNumber(con))
+				continue;
+			ev.children[ev.count].id = (int)cid->valuedouble;
+			ev.children[ev.count].on = (int)con->valuedouble;
+			ev.count++;
+		}
+		esp_event_post_to(s_relay_loop, RELAY_EVENT,
+				  RELAY_EVENT_SET_RELAY_STATE,
+				  &ev, sizeof(ev), 0);
+
+	} else if (strcmp(m, "set_alias") == 0) {
+		relay_set_alias_data_t ev = {
+			.sock     = sock,
+			.src_addr = *src,
+			.req_id   = req_id,
+			.count    = 0,
+		};
+		cJSON *arr = params ?
+			cJSON_GetObjectItem(params, "children") : NULL;
+		cJSON *child;
+
+		cJSON_ArrayForEach(child, arr) {
+			if (ev.count >= RELAY_COUNT)
+				break;
+			cJSON *cid = cJSON_GetObjectItem(child, "id");
+			cJSON *cal = cJSON_GetObjectItem(child, "alias");
+			if (!cJSON_IsNumber(cid) || !cJSON_IsString(cal))
+				continue;
+			ev.children[ev.count].id = (int)cid->valuedouble;
+			strncpy(ev.children[ev.count].alias,
+				cal->valuestring, ALIAS_MAX_LEN - 1);
+			ev.children[ev.count].alias[ALIAS_MAX_LEN - 1] = '\0';
+			ev.count++;
+		}
+		esp_event_post_to(s_relay_loop, RELAY_EVENT,
+				  RELAY_EVENT_SET_ALIAS,
+				  &ev, sizeof(ev), 0);
+
+	} else {
+		send_error(sock, src, req_id, -32601, "method not found");
+	}
+
+done:
+	cJSON_Delete(root);
+}
+
 static void udp_task(void *arg)
 {
 	char rx_buf[512];
@@ -392,8 +480,7 @@ static void udp_task(void *arg)
 	int sock = -1;
 
 	while (1) {
-		xEventGroupWaitBits(s_wifi_event_group,
-				    WIFI_CONNECTED_BIT,
+		xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT,
 				    pdFALSE, pdFALSE, portMAX_DELAY);
 
 		if (sock < 0) {
@@ -417,112 +504,7 @@ static void udp_task(void *arg)
 		rx_buf[len] = '\0';
 		ESP_LOGI(TAG, "rx: %s", rx_buf);
 
-		cJSON *root    = cJSON_Parse(rx_buf);
-		cJSON *id_item = root ?
-			cJSON_GetObjectItem(root, "id")     : NULL;
-		cJSON *method  = root ?
-			cJSON_GetObjectItem(root, "method") : NULL;
-		cJSON *params  = root ?
-			cJSON_GetObjectItem(root, "params") : NULL;
-
-		int req_id = (id_item && cJSON_IsNumber(id_item)) ?
-			     (int)id_item->valuedouble : -1;
-
-		if (!method || !cJSON_IsString(method)) {
-			send_error(sock, &src, req_id,
-				   -32600, "invalid request");
-		} else {
-			const char *m = method->valuestring;
-
-			if (strcmp(m, "get_sysinfo") == 0) {
-				relay_sysinfo_data_t ev = {
-					.sock     = sock,
-					.src_addr = src,
-					.req_id   = req_id,
-				};
-				esp_event_post_to(s_relay_loop, RELAY_EVENT,
-						  RELAY_EVENT_GET_SYSINFO,
-						  &ev, sizeof(ev), 0);
-
-			} else if (strcmp(m, "set_relay_state") == 0) {
-				relay_set_state_data_t ev = {
-					.sock     = sock,
-					.src_addr = src,
-					.req_id   = req_id,
-					.count    = 0,
-				};
-				cJSON *arr = params ?
-					cJSON_GetObjectItem(params,
-							    "children") : NULL;
-				cJSON *child;
-
-				cJSON_ArrayForEach(child, arr) {
-					if (ev.count >= RELAY_COUNT)
-						break;
-					cJSON *cid =
-						cJSON_GetObjectItem(child,
-								    "id");
-					cJSON *con =
-						cJSON_GetObjectItem(child,
-								    "on");
-					if (!cJSON_IsNumber(cid) ||
-					    !cJSON_IsNumber(con))
-						continue;
-					ev.children[ev.count].id =
-						(int)cid->valuedouble;
-					ev.children[ev.count].on =
-						(int)con->valuedouble;
-					ev.count++;
-				}
-				esp_event_post_to(s_relay_loop, RELAY_EVENT,
-						  RELAY_EVENT_SET_RELAY_STATE,
-						  &ev, sizeof(ev), 0);
-
-			} else if (strcmp(m, "set_alias") == 0) {
-				relay_set_alias_data_t ev = {
-					.sock     = sock,
-					.src_addr = src,
-					.req_id   = req_id,
-					.count    = 0,
-				};
-				cJSON *arr = params ?
-					cJSON_GetObjectItem(params,
-							    "children") : NULL;
-				cJSON *child;
-
-				cJSON_ArrayForEach(child, arr) {
-					if (ev.count >= RELAY_COUNT)
-						break;
-					cJSON *cid =
-						cJSON_GetObjectItem(child,
-								    "id");
-					cJSON *cal =
-						cJSON_GetObjectItem(child,
-								    "alias");
-					if (!cJSON_IsNumber(cid) ||
-					    !cJSON_IsString(cal))
-						continue;
-					ev.children[ev.count].id =
-						(int)cid->valuedouble;
-					strncpy(ev.children[ev.count].alias,
-						cal->valuestring,
-						ALIAS_MAX_LEN - 1);
-					ev.children[ev.count].alias[
-						ALIAS_MAX_LEN - 1] = '\0';
-					ev.count++;
-				}
-				esp_event_post_to(s_relay_loop, RELAY_EVENT,
-						  RELAY_EVENT_SET_ALIAS,
-						  &ev, sizeof(ev), 0);
-
-			} else {
-				send_error(sock, &src, req_id,
-					   -32601, "method not found");
-			}
-		}
-
-		if (root)
-			cJSON_Delete(root);
+		handle_rpc_request(sock, &src, rx_buf);
 	}
 }
 
@@ -561,7 +543,7 @@ void app_main(void)
 
 	relay_init();
 	relay_alias_load();
-	wifi_init_sta();
+	wifi_setup();
 	ESP_LOGI(TAG, "starting udp task");
 	xTaskCreate(udp_task, "udp_task", 4096, NULL, 5, NULL);
 }
