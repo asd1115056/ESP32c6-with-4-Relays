@@ -31,26 +31,29 @@ static const int s_relay_gpio[RELAY_COUNT] = { 19, 20, 21, 22 };
 ESP_EVENT_DEFINE_BASE(RELAY_EVENT);
 
 typedef enum {
-	RELAY_EVENT_HELLO,
-	RELAY_EVENT_SET,
+	RELAY_EVENT_GET_SYSINFO,
+	RELAY_EVENT_SET_RELAY_STATE,
 	RELAY_EVENT_SET_ALIAS,
 } relay_event_id_t;
 
 typedef struct {
 	int sock;
 	struct sockaddr_in src_addr;
-} relay_hello_data_t;
+	int req_id;		/* -1 if not present in request */
+} relay_sysinfo_data_t;
 
 typedef struct {
 	int sock;
 	struct sockaddr_in src_addr;
+	int req_id;
 	struct { int id; int on; } children[RELAY_COUNT];
 	int count;
-} relay_set_data_t;
+} relay_set_state_data_t;
 
 typedef struct {
 	int sock;
 	struct sockaddr_in src_addr;
+	int req_id;
 	struct { int id; char alias[ALIAS_MAX_LEN]; } children[RELAY_COUNT];
 	int count;
 } relay_set_alias_data_t;
@@ -115,6 +118,8 @@ static void prov_event_handler(void *arg, esp_event_base_t base,
 		break;
 	}
 }
+
+/* ── Relay ────────────────────────────────────────────────────────── */
 
 static void relay_init(void)
 {
@@ -216,7 +221,7 @@ static void wifi_init_sta(void)
 			    pdFALSE, pdFALSE, portMAX_DELAY);
 }
 
-/* ── Event handlers ───────────────────────────────────────────────── */
+/* ── JSON-RPC helpers ─────────────────────────────────────────────── */
 
 static void build_children_array(cJSON *parent)
 {
@@ -232,10 +237,49 @@ static void build_children_array(cJSON *parent)
 	cJSON_AddItemToObject(parent, "children", children);
 }
 
-static void hello_handler(void *arg, esp_event_base_t base,
-			   int32_t id, void *data)
+static void send_result(int sock, struct sockaddr_in *addr,
+			int req_id, cJSON *result)
 {
-	relay_hello_data_t *d = data;
+	cJSON *reply = cJSON_CreateObject();
+
+	if (req_id >= 0)
+		cJSON_AddNumberToObject(reply, "id", req_id);
+	cJSON_AddItemToObject(reply, "result", result);
+
+	char *s = cJSON_PrintUnformatted(reply);
+	cJSON_Delete(reply);
+	sendto(sock, s, strlen(s), 0,
+	       (struct sockaddr *)addr, sizeof(*addr));
+	ESP_LOGI(TAG, "tx: %s", s);
+	free(s);
+}
+
+static void send_error(int sock, struct sockaddr_in *addr,
+		       int req_id, int code, const char *msg)
+{
+	cJSON *reply = cJSON_CreateObject();
+	cJSON *err   = cJSON_CreateObject();
+
+	if (req_id >= 0)
+		cJSON_AddNumberToObject(reply, "id", req_id);
+	cJSON_AddNumberToObject(err, "code", code);
+	cJSON_AddStringToObject(err, "message", msg);
+	cJSON_AddItemToObject(reply, "error", err);
+
+	char *s = cJSON_PrintUnformatted(reply);
+	cJSON_Delete(reply);
+	sendto(sock, s, strlen(s), 0,
+	       (struct sockaddr *)addr, sizeof(*addr));
+	ESP_LOGW(TAG, "tx error: %s", s);
+	free(s);
+}
+
+/* ── Event handlers ───────────────────────────────────────────────── */
+
+static void get_sysinfo_handler(void *arg, esp_event_base_t base,
+				int32_t id, void *data)
+{
+	relay_sysinfo_data_t *d = data;
 	esp_netif_t *netif =
 		esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
 	esp_netif_ip_info_t ip_info;
@@ -245,37 +289,26 @@ static void hello_handler(void *arg, esp_event_base_t base,
 
 	esp_netif_get_ip_info(netif, &ip_info);
 	esp_netif_get_mac(netif, mac);
-
 	inet_ntoa_r(ip_info.ip.addr, ip_str, sizeof(ip_str));
 	snprintf(mac_str, sizeof(mac_str),
 		 "%02x:%02x:%02x:%02x:%02x:%02x",
 		 mac[0], mac[1], mac[2],
 		 mac[3], mac[4], mac[5]);
 
-	cJSON *sysinfo = cJSON_CreateObject();
-	cJSON_AddStringToObject(sysinfo, "mac", mac_str);
-	cJSON_AddStringToObject(sysinfo, "ip", ip_str);
-	cJSON_AddStringToObject(sysinfo, "type", "relay4");
-	cJSON_AddStringToObject(sysinfo, "version", "1.0");
-	build_children_array(sysinfo);
-	cJSON_AddNumberToObject(sysinfo, "err_code", 0);
+	cJSON *result = cJSON_CreateObject();
+	cJSON_AddStringToObject(result, "mac", mac_str);
+	cJSON_AddStringToObject(result, "ip", ip_str);
+	cJSON_AddStringToObject(result, "type", "relay4");
+	cJSON_AddStringToObject(result, "version", "1.0");
+	build_children_array(result);
 
-	cJSON *reply = cJSON_CreateObject();
-	cJSON_AddItemToObject(reply, "sysinfo", sysinfo);
-	char *reply_str = cJSON_PrintUnformatted(reply);
-	cJSON_Delete(reply);
-
-	sendto(d->sock, reply_str, strlen(reply_str), 0,
-	       (struct sockaddr *)&d->src_addr,
-	       sizeof(d->src_addr));
-	ESP_LOGI(TAG, "sysinfo reply: %s", reply_str);
-	free(reply_str);
+	send_result(d->sock, &d->src_addr, d->req_id, result);
 }
 
-static void set_handler(void *arg, esp_event_base_t base,
-			int32_t id, void *data)
+static void set_relay_state_handler(void *arg, esp_event_base_t base,
+				     int32_t id, void *data)
 {
-	relay_set_data_t *d = data;
+	relay_set_state_data_t *d = data;
 
 	for (int i = 0; i < d->count; i++) {
 		int rid = d->children[i].id;
@@ -287,24 +320,13 @@ static void set_handler(void *arg, esp_event_base_t base,
 		gpio_set_level(s_relay_gpio[rid], on ? 0 : 1);
 	}
 
-	cJSON *set = cJSON_CreateObject();
-	build_children_array(set);
-	cJSON_AddNumberToObject(set, "err_code", 0);
-
-	cJSON *reply = cJSON_CreateObject();
-	cJSON_AddItemToObject(reply, "set", set);
-	char *reply_str = cJSON_PrintUnformatted(reply);
-	cJSON_Delete(reply);
-
-	sendto(d->sock, reply_str, strlen(reply_str), 0,
-	       (struct sockaddr *)&d->src_addr,
-	       sizeof(d->src_addr));
-	ESP_LOGI(TAG, "set reply: %s", reply_str);
-	free(reply_str);
+	cJSON *result = cJSON_CreateObject();
+	build_children_array(result);
+	send_result(d->sock, &d->src_addr, d->req_id, result);
 }
 
 static void set_alias_handler(void *arg, esp_event_base_t base,
-			       int32_t id, void *data)
+			      int32_t id, void *data)
 {
 	relay_set_alias_data_t *d = data;
 	nvs_handle_t h;
@@ -325,20 +347,9 @@ static void set_alias_handler(void *arg, esp_event_base_t base,
 		nvs_close(h);
 	}
 
-	cJSON *set_alias = cJSON_CreateObject();
-	build_children_array(set_alias);
-	cJSON_AddNumberToObject(set_alias, "err_code", 0);
-
-	cJSON *reply = cJSON_CreateObject();
-	cJSON_AddItemToObject(reply, "set_alias", set_alias);
-	char *reply_str = cJSON_PrintUnformatted(reply);
-	cJSON_Delete(reply);
-
-	sendto(d->sock, reply_str, strlen(reply_str), 0,
-	       (struct sockaddr *)&d->src_addr,
-	       sizeof(d->src_addr));
-	ESP_LOGI(TAG, "set_alias reply: %s", reply_str);
-	free(reply_str);
+	cJSON *result = cJSON_CreateObject();
+	build_children_array(result);
+	send_result(d->sock, &d->src_addr, d->req_id, result);
 }
 
 /* ── UDP task ─────────────────────────────────────────────────────── */
@@ -375,7 +386,7 @@ static int open_udp_socket(void)
 
 static void udp_task(void *arg)
 {
-	char rx_buf[256];
+	char rx_buf[512];
 	struct sockaddr_in src;
 	socklen_t src_len = sizeof(src);
 	int sock = -1;
@@ -404,78 +415,110 @@ static void udp_task(void *arg)
 			continue;
 		}
 		rx_buf[len] = '\0';
+		ESP_LOGI(TAG, "rx: %s", rx_buf);
 
-		cJSON *root = cJSON_Parse(rx_buf);
-		cJSON *cmd  = root ?
-			cJSON_GetObjectItem(root, "cmd") : NULL;
+		cJSON *root    = cJSON_Parse(rx_buf);
+		cJSON *id_item = root ?
+			cJSON_GetObjectItem(root, "id")     : NULL;
+		cJSON *method  = root ?
+			cJSON_GetObjectItem(root, "method") : NULL;
+		cJSON *params  = root ?
+			cJSON_GetObjectItem(root, "params") : NULL;
 
-		if (cmd && cJSON_IsString(cmd) &&
-		    strcmp(cmd->valuestring, "set_alias") == 0) {
-			relay_set_alias_data_t ev = {
-				.sock     = sock,
-				.src_addr = src,
-				.count    = 0,
-			};
-			cJSON *arr = cJSON_GetObjectItem(root, "children");
-			cJSON *child;
+		int req_id = (id_item && cJSON_IsNumber(id_item)) ?
+			     (int)id_item->valuedouble : -1;
 
-			cJSON_ArrayForEach(child, arr) {
-				if (ev.count >= RELAY_COUNT)
-					break;
-				cJSON *cid = cJSON_GetObjectItem(child, "id");
-				cJSON *cal =
-					cJSON_GetObjectItem(child, "alias");
-				if (!cJSON_IsNumber(cid) ||
-				    !cJSON_IsString(cal))
-					continue;
-				ev.children[ev.count].id =
-					(int)cid->valuedouble;
-				strncpy(ev.children[ev.count].alias,
-					cal->valuestring, ALIAS_MAX_LEN - 1);
-				ev.children[ev.count].alias[
-					ALIAS_MAX_LEN - 1] = '\0';
-				ev.count++;
-			}
-			esp_event_post_to(s_relay_loop, RELAY_EVENT,
-					  RELAY_EVENT_SET_ALIAS,
-					  &ev, sizeof(ev), 0);
-		} else if (cmd && cJSON_IsString(cmd) &&
-		    strcmp(cmd->valuestring, "set") == 0) {
-			relay_set_data_t ev = {
-				.sock     = sock,
-				.src_addr = src,
-				.count    = 0,
-			};
-			cJSON *arr = cJSON_GetObjectItem(root, "children");
-			cJSON *child;
-
-			cJSON_ArrayForEach(child, arr) {
-				if (ev.count >= RELAY_COUNT)
-					break;
-				cJSON *cid =
-					cJSON_GetObjectItem(child, "id");
-				cJSON *con =
-					cJSON_GetObjectItem(child, "on");
-				if (!cJSON_IsNumber(cid) ||
-				    !cJSON_IsNumber(con))
-					continue;
-				ev.children[ev.count].id =
-					(int)cid->valuedouble;
-				ev.children[ev.count].on =
-					(int)con->valuedouble;
-				ev.count++;
-			}
-			esp_event_post_to(s_relay_loop, RELAY_EVENT,
-					  RELAY_EVENT_SET,
-					  &ev, sizeof(ev), 0);
+		if (!method || !cJSON_IsString(method)) {
+			send_error(sock, &src, req_id,
+				   -32600, "invalid request");
 		} else {
-			relay_hello_data_t ev = {
-				.sock     = sock,
-				.src_addr = src,
-			};
-			esp_event_post_to(s_relay_loop, RELAY_EVENT,
-					  RELAY_EVENT_HELLO,
-					  &ev, sizeof(ev), 0);
+			const char *m = method->valuestring;
+
+			if (strcmp(m, "get_sysinfo") == 0) {
+				relay_sysinfo_data_t ev = {
+					.sock     = sock,
+					.src_addr = src,
+					.req_id   = req_id,
+				};
+				esp_event_post_to(s_relay_loop, RELAY_EVENT,
+						  RELAY_EVENT_GET_SYSINFO,
+						  &ev, sizeof(ev), 0);
+
+			} else if (strcmp(m, "set_relay_state") == 0) {
+				relay_set_state_data_t ev = {
+					.sock     = sock,
+					.src_addr = src,
+					.req_id   = req_id,
+					.count    = 0,
+				};
+				cJSON *arr = params ?
+					cJSON_GetObjectItem(params,
+							    "children") : NULL;
+				cJSON *child;
+
+				cJSON_ArrayForEach(child, arr) {
+					if (ev.count >= RELAY_COUNT)
+						break;
+					cJSON *cid =
+						cJSON_GetObjectItem(child,
+								    "id");
+					cJSON *con =
+						cJSON_GetObjectItem(child,
+								    "on");
+					if (!cJSON_IsNumber(cid) ||
+					    !cJSON_IsNumber(con))
+						continue;
+					ev.children[ev.count].id =
+						(int)cid->valuedouble;
+					ev.children[ev.count].on =
+						(int)con->valuedouble;
+					ev.count++;
+				}
+				esp_event_post_to(s_relay_loop, RELAY_EVENT,
+						  RELAY_EVENT_SET_RELAY_STATE,
+						  &ev, sizeof(ev), 0);
+
+			} else if (strcmp(m, "set_alias") == 0) {
+				relay_set_alias_data_t ev = {
+					.sock     = sock,
+					.src_addr = src,
+					.req_id   = req_id,
+					.count    = 0,
+				};
+				cJSON *arr = params ?
+					cJSON_GetObjectItem(params,
+							    "children") : NULL;
+				cJSON *child;
+
+				cJSON_ArrayForEach(child, arr) {
+					if (ev.count >= RELAY_COUNT)
+						break;
+					cJSON *cid =
+						cJSON_GetObjectItem(child,
+								    "id");
+					cJSON *cal =
+						cJSON_GetObjectItem(child,
+								    "alias");
+					if (!cJSON_IsNumber(cid) ||
+					    !cJSON_IsString(cal))
+						continue;
+					ev.children[ev.count].id =
+						(int)cid->valuedouble;
+					strncpy(ev.children[ev.count].alias,
+						cal->valuestring,
+						ALIAS_MAX_LEN - 1);
+					ev.children[ev.count].alias[
+						ALIAS_MAX_LEN - 1] = '\0';
+					ev.count++;
+				}
+				esp_event_post_to(s_relay_loop, RELAY_EVENT,
+						  RELAY_EVENT_SET_ALIAS,
+						  &ev, sizeof(ev), 0);
+
+			} else {
+				send_error(sock, &src, req_id,
+					   -32601, "method not found");
+			}
 		}
 
 		if (root)
@@ -507,11 +550,11 @@ void app_main(void)
 	vTaskDelay(pdMS_TO_TICKS(30000));
 	ESP_ERROR_CHECK(esp_event_loop_create(&loop_args, &s_relay_loop));
 	ESP_ERROR_CHECK(esp_event_handler_register_with(
-		s_relay_loop, RELAY_EVENT, RELAY_EVENT_HELLO,
-		hello_handler, NULL));
+		s_relay_loop, RELAY_EVENT, RELAY_EVENT_GET_SYSINFO,
+		get_sysinfo_handler, NULL));
 	ESP_ERROR_CHECK(esp_event_handler_register_with(
-		s_relay_loop, RELAY_EVENT, RELAY_EVENT_SET,
-		set_handler, NULL));
+		s_relay_loop, RELAY_EVENT, RELAY_EVENT_SET_RELAY_STATE,
+		set_relay_state_handler, NULL));
 	ESP_ERROR_CHECK(esp_event_handler_register_with(
 		s_relay_loop, RELAY_EVENT, RELAY_EVENT_SET_ALIAS,
 		set_alias_handler, NULL));
