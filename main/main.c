@@ -8,6 +8,7 @@
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "nvs_flash.h"
+#include "esp_system.h"
 #include "lwip/sockets.h"
 #include "cJSON.h"
 #include "network_provisioning/manager.h"
@@ -63,7 +64,7 @@ static EventGroupHandle_t s_wifi_event_group;
 static esp_event_loop_handle_t s_relay_loop;
 static int s_retry_count;
 static bool s_provisioned;
-static int s_relay_state[RELAY_COUNT];
+static __NOINIT_ATTR int s_relay_state[RELAY_COUNT];
 static char s_relay_alias[RELAY_COUNT][ALIAS_MAX_LEN];
 
 /* ── Wi-Fi ────────────────────────────────────────────────────────── */
@@ -177,11 +178,14 @@ static void wifi_setup(void)
 
 static void relay_init(void)
 {
+	bool sw_reset = esp_reset_reason() == ESP_RST_SW;
+
 	for (int i = 0; i < RELAY_COUNT; i++) {
+		if (!sw_reset)
+			s_relay_state[i] = 0;
 		gpio_reset_pin(s_relay_gpio[i]);
-		gpio_set_level(s_relay_gpio[i], 0);        /* pre-set LOW before enabling output */
+		gpio_set_level(s_relay_gpio[i], s_relay_state[i]);
 		gpio_set_direction(s_relay_gpio[i], GPIO_MODE_OUTPUT);
-		s_relay_state[i] = 0;
 	}
 }
 
