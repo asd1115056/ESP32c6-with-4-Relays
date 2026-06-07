@@ -17,7 +17,7 @@
 #include "nvs.h"
 
 #define UDP_PORT		12345
-#define WIFI_MAX_RETRY		5
+#define WIFI_MAX_RETRY		10
 #define RESET_GPIO		11
 #define RESET_HOLD_MS		3000
 
