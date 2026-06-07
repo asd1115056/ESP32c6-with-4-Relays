@@ -13,6 +13,7 @@
 #include "network_provisioning/manager.h"
 #include "network_provisioning/scheme_ble.h"
 #include "driver/gpio.h"
+#include "nvs.h"
 
 #define UDP_PORT		12345
 #define WIFI_MAX_RETRY		5
@@ -20,6 +21,9 @@
 #define RESET_HOLD_MS		3000
 
 #define RELAY_COUNT		4
+#define ALIAS_MAX_LEN		32
+#define RELAY_NVS_NS		"relay"
+
 static const int s_relay_gpio[RELAY_COUNT] = { 19, 20, 21, 22 };
 
 #define WIFI_CONNECTED_BIT	BIT0
@@ -29,6 +33,7 @@ ESP_EVENT_DEFINE_BASE(RELAY_EVENT);
 typedef enum {
 	RELAY_EVENT_HELLO,
 	RELAY_EVENT_SET,
+	RELAY_EVENT_SET_ALIAS,
 } relay_event_id_t;
 
 typedef struct {
@@ -43,12 +48,20 @@ typedef struct {
 	int count;
 } relay_set_data_t;
 
+typedef struct {
+	int sock;
+	struct sockaddr_in src_addr;
+	struct { int id; char alias[ALIAS_MAX_LEN]; } children[RELAY_COUNT];
+	int count;
+} relay_set_alias_data_t;
+
 static const char *TAG = "relay";
 static EventGroupHandle_t s_wifi_event_group;
 static esp_event_loop_handle_t s_relay_loop;
 static int s_retry_count;
 static bool s_prov_done;
 static int s_relay_state[RELAY_COUNT];
+static char s_relay_alias[RELAY_COUNT][ALIAS_MAX_LEN];
 
 /* ── WiFi ─────────────────────────────────────────────────────────── */
 
@@ -111,6 +124,25 @@ static void relay_init(void)
 		gpio_set_level(s_relay_gpio[i], 1); /* active LOW: HIGH = off */
 		s_relay_state[i] = 0;
 	}
+}
+
+static void relay_alias_load(void)
+{
+	nvs_handle_t h;
+	char key[10];
+
+	for (int i = 0; i < RELAY_COUNT; i++)
+		snprintf(s_relay_alias[i], ALIAS_MAX_LEN, "relay_%d", i);
+
+	if (nvs_open(RELAY_NVS_NS, NVS_READONLY, &h) != ESP_OK)
+		return;
+
+	for (int i = 0; i < RELAY_COUNT; i++) {
+		snprintf(key, sizeof(key), "alias_%d", i);
+		size_t len = ALIAS_MAX_LEN;
+		nvs_get_str(h, key, s_relay_alias[i], &len);
+	}
+	nvs_close(h);
 }
 
 static bool reset_button_held(void)
@@ -193,6 +225,7 @@ static void build_children_array(cJSON *parent)
 	for (int i = 0; i < RELAY_COUNT; i++) {
 		cJSON *child = cJSON_CreateObject();
 		cJSON_AddNumberToObject(child, "id", i);
+		cJSON_AddStringToObject(child, "alias", s_relay_alias[i]);
 		cJSON_AddNumberToObject(child, "on", s_relay_state[i]);
 		cJSON_AddItemToArray(children, child);
 	}
@@ -270,6 +303,44 @@ static void set_handler(void *arg, esp_event_base_t base,
 	free(reply_str);
 }
 
+static void set_alias_handler(void *arg, esp_event_base_t base,
+			       int32_t id, void *data)
+{
+	relay_set_alias_data_t *d = data;
+	nvs_handle_t h;
+	char key[10];
+
+	if (nvs_open(RELAY_NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
+		for (int i = 0; i < d->count; i++) {
+			int rid = d->children[i].id;
+			if (rid < 0 || rid >= RELAY_COUNT)
+				continue;
+			strncpy(s_relay_alias[rid], d->children[i].alias,
+				ALIAS_MAX_LEN - 1);
+			s_relay_alias[rid][ALIAS_MAX_LEN - 1] = '\0';
+			snprintf(key, sizeof(key), "alias_%d", rid);
+			nvs_set_str(h, key, s_relay_alias[rid]);
+		}
+		nvs_commit(h);
+		nvs_close(h);
+	}
+
+	cJSON *set_alias = cJSON_CreateObject();
+	build_children_array(set_alias);
+	cJSON_AddNumberToObject(set_alias, "err_code", 0);
+
+	cJSON *reply = cJSON_CreateObject();
+	cJSON_AddItemToObject(reply, "set_alias", set_alias);
+	char *reply_str = cJSON_PrintUnformatted(reply);
+	cJSON_Delete(reply);
+
+	sendto(d->sock, reply_str, strlen(reply_str), 0,
+	       (struct sockaddr *)&d->src_addr,
+	       sizeof(d->src_addr));
+	ESP_LOGI(TAG, "set_alias reply: %s", reply_str);
+	free(reply_str);
+}
+
 /* ── UDP task ─────────────────────────────────────────────────────── */
 
 static int open_udp_socket(void)
@@ -339,6 +410,36 @@ static void udp_task(void *arg)
 			cJSON_GetObjectItem(root, "cmd") : NULL;
 
 		if (cmd && cJSON_IsString(cmd) &&
+		    strcmp(cmd->valuestring, "set_alias") == 0) {
+			relay_set_alias_data_t ev = {
+				.sock     = sock,
+				.src_addr = src,
+				.count    = 0,
+			};
+			cJSON *arr = cJSON_GetObjectItem(root, "children");
+			cJSON *child;
+
+			cJSON_ArrayForEach(child, arr) {
+				if (ev.count >= RELAY_COUNT)
+					break;
+				cJSON *cid = cJSON_GetObjectItem(child, "id");
+				cJSON *cal =
+					cJSON_GetObjectItem(child, "alias");
+				if (!cJSON_IsNumber(cid) ||
+				    !cJSON_IsString(cal))
+					continue;
+				ev.children[ev.count].id =
+					(int)cid->valuedouble;
+				strncpy(ev.children[ev.count].alias,
+					cal->valuestring, ALIAS_MAX_LEN - 1);
+				ev.children[ev.count].alias[
+					ALIAS_MAX_LEN - 1] = '\0';
+				ev.count++;
+			}
+			esp_event_post_to(s_relay_loop, RELAY_EVENT,
+					  RELAY_EVENT_SET_ALIAS,
+					  &ev, sizeof(ev), 0);
+		} else if (cmd && cJSON_IsString(cmd) &&
 		    strcmp(cmd->valuestring, "set") == 0) {
 			relay_set_data_t ev = {
 				.sock     = sock,
@@ -411,8 +512,12 @@ void app_main(void)
 	ESP_ERROR_CHECK(esp_event_handler_register_with(
 		s_relay_loop, RELAY_EVENT, RELAY_EVENT_SET,
 		set_handler, NULL));
+	ESP_ERROR_CHECK(esp_event_handler_register_with(
+		s_relay_loop, RELAY_EVENT, RELAY_EVENT_SET_ALIAS,
+		set_alias_handler, NULL));
 
 	relay_init();
+	relay_alias_load();
 	wifi_init_sta();
 	ESP_LOGI(TAG, "starting udp task");
 	xTaskCreate(udp_task, "udp_task", 4096, NULL, 5, NULL);
