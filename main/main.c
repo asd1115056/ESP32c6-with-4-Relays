@@ -24,7 +24,7 @@
 #define ALIAS_MAX_LEN		32
 #define RELAY_NVS_NS		"relay"
 
-static const int s_relay_gpio[RELAY_COUNT] = { 19, 20, 21, 22 };
+static const int s_relay_gpio[RELAY_COUNT] = { 20, 21, 22, 23 };
 
 #define WIFI_CONNECTED_BIT	BIT0
 
