@@ -179,8 +179,8 @@ static void relay_init(void)
 {
 	for (int i = 0; i < RELAY_COUNT; i++) {
 		gpio_reset_pin(s_relay_gpio[i]);
+		gpio_set_level(s_relay_gpio[i], 0);        /* pre-set LOW before enabling output */
 		gpio_set_direction(s_relay_gpio[i], GPIO_MODE_OUTPUT);
-		gpio_set_level(s_relay_gpio[i], 1); /* active LOW: HIGH = off */
 		s_relay_state[i] = 0;
 	}
 }
@@ -315,7 +315,7 @@ static void set_relay_state_handler(void *arg, esp_event_base_t base,
 		if (rid < 0 || rid >= RELAY_COUNT)
 			continue;
 		s_relay_state[rid] = on;
-		gpio_set_level(s_relay_gpio[rid], on ? 0 : 1);
+		gpio_set_level(s_relay_gpio[rid], on ? 1 : 0);
 	}
 
 	cJSON *result = cJSON_CreateObject();

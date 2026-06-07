@@ -4,13 +4,13 @@
 
 | Function | GPIO | Notes |
 |---|---|---|
-| Relay 0 | 20 | Active LOW |
-| Relay 1 | 21 | Active LOW |
-| Relay 2 | 22 | Active LOW |
-| Relay 3 | 23 | Active LOW |
+| Relay 0 | 20 | Active HIGH |
+| Relay 1 | 21 | Active HIGH |
+| Relay 2 | 22 | Active HIGH |
+| Relay 3 | 23 | Active HIGH |
 | Wi-Fi Reset | 11 | Pull to GND, hold 3 s |
 
-Active LOW: GPIO HIGH = relay off, GPIO LOW = relay on.
+Active HIGH: GPIO HIGH = relay on, GPIO LOW = relay off.
 
 ## Build & Flash
 
